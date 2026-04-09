@@ -250,10 +250,17 @@ function isValidFile(filename) {
   return CONFIG.VALID_EXTENSIONS.some(ext => lower.endsWith(ext));
 }
 
+// Bảng chuẩn hoá các email bị gõ sai / alias — giúp khớp đúng TP/NV
+// khi người gửi dùng biến thể domain nhỏ (tránh HR phải sửa tay cột Email).
+const EMAIL_ALIASES_ = {
+  'toanlv@mastsaigon.com.vn': 'toanlv@mastsaigon.com'
+};
+
 function extractEmail(fromField) {
   if (!fromField) return '';
   const match = fromField.match(/<(.+?)>/);
-  return match ? match[1].toLowerCase().trim() : fromField.toLowerCase().trim();
+  const raw = match ? match[1].toLowerCase().trim() : fromField.toLowerCase().trim();
+  return EMAIL_ALIASES_[raw] || raw;
 }
 
 function extractSenderName(fromField) {
@@ -366,6 +373,120 @@ function computeFileHash(attachment) {
 }
 
 // ============================================================================
+// PHÂN LOẠI BÁO CÁO & ĐỒNG BỘ PHÒNG BAN (bổ sung v2.2.1)
+// ============================================================================
+
+// Map cố định: email TP → tên phòng ban chính thức.
+// Dùng để tự điền cột PhongBan cho các dòng đang là "MỚI_TỰ_ĐỘNG" hoặc rỗng
+// → HR không cần điền thủ công cho những người đã biết vị trí trong công ty.
+const TP_PHONGBAN_MAP_ = {
+  'linhdt@mast.com.vn':      'Kho',
+  'tunv@mast.com.vn':        'Điều vận',
+  'chienmt@mast.com.vn':     'Kế toán',
+  'hoangvd@mast.com.vn':     'Nhập mua',
+  'luongpt@mast.com.vn':     'Kinh doanh',
+  'khanhxuan@mast.com.vn':   'HCNS',
+  'nhanntt@mastsaigon.com':  'Ban Giám đốc SG',
+  'anhntt@mastsaigon.com':   'Kế toán SG',
+  'sonpt@mast.com.vn':       'Kinh doanh SG',
+  'toanlv@mastsaigon.com':   'Điều vận SG',
+  'nhansu@mastsaigon.com':   'HCNS SG',
+  'baond@mastsaigon.com':    'Kho SG'
+};
+
+/**
+ * Phân loại báo cáo dựa trên tiêu đề email.
+ * Chỉ bắt các tín hiệu CHẮC CHẮN — nếu không rõ thì mặc định 'BC Tuần'
+ * để giữ nguyên hành vi cũ, tránh phân loại sai.
+ * @param {string} subject
+ * @returns {'BC Tuần'|'BC Tháng'|'BC KH Tháng'|'BC KPI'|'BC Tổng kết'}
+ */
+function classifyReportType(subject) {
+  const s = (subject || '').toLowerCase().trim();
+  if (!s) return 'BC Tuần';
+  const n = s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd');
+
+  // BC Tổng kết (ưu tiên cao nhất)
+  if (/\btong\s*ket\b/.test(n)) return 'BC Tổng kết';
+  // BC Kế hoạch tháng
+  if (/\bke\s*hoach\s*thang\b|\bkh\s*thang\b/.test(n)) return 'BC KH Tháng';
+  // BC KPI — chỉ khớp khi có kèm "tháng" để tránh false-positive với BC tuần có nhắc KPI
+  if (/\bkpi\b/.test(n) && /\bthang\b/.test(n)) return 'BC KPI';
+  // BC tháng tổng quát
+  if (/\bbao\s*cao\s*thang\b|\bbc\s*thang\b|\bbct\s*\d/.test(n)) return 'BC Tháng';
+
+  return 'BC Tuần';
+}
+
+/**
+ * Tính deadline theo loại báo cáo đã phân loại.
+ * @param {'BC Tuần'|'BC Tháng'|'BC KH Tháng'|'BC KPI'|'BC Tổng kết'} reportType
+ * @param {Date} submitTime
+ * @param {string} email
+ */
+function getDeadlineForReport_(reportType, submitTime, email) {
+  const emailLower = (email || '').toLowerCase().trim();
+
+  if (reportType === 'BC Tuần') {
+    return getDeadlineForEmail(submitTime, emailLower);
+  }
+
+  if (reportType === 'BC Tổng kết') {
+    const d = (submitTime instanceof Date && !isNaN(submitTime.getTime()))
+      ? new Date(submitTime) : new Date();
+    const cfg = CONFIG.SUMMARY_REPORT_DEADLINE;
+    let target = new Date(d.getFullYear(), d.getMonth(), cfg.day, cfg.hour, cfg.minute, 0, 0);
+    if (d.getTime() > target.getTime()) {
+      target = new Date(d.getFullYear(), d.getMonth() + 1, cfg.day, cfg.hour, cfg.minute, 0, 0);
+    }
+    return target;
+  }
+
+  // BC Tháng / BC KH Tháng / BC KPI
+  // Thứ tự ưu tiên: custom deadline → TP dùng ngày 28 → NV dùng ngày 3
+  if (CONFIG.CUSTOM_MONTHLY_DEADLINES[emailLower]) {
+    return getMonthlyDeadlineNV(submitTime, emailLower);
+  }
+  if (isTruongPhong(emailLower)) {
+    return getMonthlyDeadlineTP(submitTime);
+  }
+  return getMonthlyDeadlineNV(submitTime, emailLower);
+}
+
+/**
+ * Nếu email là TP trong TP_PHONGBAN_MAP_ và dòng trong sheet đang để
+ * "MỚI_TỰ_ĐỘNG" hoặc rỗng → tự điền phòng ban đúng. Không ghi đè nếu
+ * HR đã nhập giá trị hợp lệ.
+ * @param {string} email
+ */
+function syncPhongBanForTP_(email) {
+  try {
+    const key = (email || '').toLowerCase().trim();
+    const expected = TP_PHONGBAN_MAP_[key];
+    if (!expected) return;
+
+    const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+    const sheet = ss.getSheetByName(CONFIG.SHEET_EMPLOYEES);
+    if (!sheet || sheet.getLastRow() < 2) return;
+
+    const data = sheet.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+      const rowEmail = (data[i][CONFIG.COL_EMAIL] || '').toString().toLowerCase().trim();
+      if (rowEmail !== key) continue;
+
+      const current = (data[i][CONFIG.COL_PHONGBAN] || '').toString().trim();
+      if (!current || current === 'MỚI_TỰ_ĐỘNG') {
+        sheet.getRange(i + 1, CONFIG.COL_PHONGBAN + 1).setValue(expected);
+        Logger.log('✓ Tự cập nhật phòng ban: ' + key + ' → ' + expected);
+      }
+      return;
+    }
+  } catch (e) {
+    Logger.log('✗ Lỗi syncPhongBanForTP_: ' + e.message);
+  }
+}
+
+// ============================================================================
 // TRUY CẬP DỮ LIỆU
 // ============================================================================
 
@@ -403,8 +524,10 @@ function autoAddEmployee(email, senderName) {
       sheet.getRange(1, 1, 1, 3).setValues([['Email', 'HoTen', 'PhongBan']]);
       sheet.getRange(1, 1, 1, 3).setFontWeight('bold').setBackground('#4a86e8').setFontColor('white');
     }
-    sheet.appendRow([email, senderName, 'MỚI_TỰ_ĐỘNG']);
-    Logger.log('✓ Tự động thêm nhân viên: ' + email + ' (' + senderName + ')');
+    // Nếu là TP đã biết trước → điền luôn phòng ban đúng, HR không phải sửa tay
+    const phongBan = TP_PHONGBAN_MAP_[(email || '').toLowerCase().trim()] || 'MỚI_TỰ_ĐỘNG';
+    sheet.appendRow([email, senderName, phongBan]);
+    Logger.log('✓ Tự động thêm nhân viên: ' + email + ' (' + senderName + ') [' + phongBan + ']');
   } catch (error) {
     Logger.log('✗ Lỗi autoAddEmployee: ' + error.message);
   }
@@ -539,7 +662,8 @@ function processEmails() {
           if (!employee) {
             const senderName = extractSenderName(message.getFrom());
             autoAddEmployee(senderEmail, senderName);
-            employee = { email: senderEmail, hoTen: senderName, phongBan: 'MỚI_TỰ_ĐỘNG' };
+            const inferredPhongBan = TP_PHONGBAN_MAP_[senderEmail] || 'MỚI_TỰ_ĐỘNG';
+            employee = { email: senderEmail, hoTen: senderName, phongBan: inferredPhongBan };
             employees.set(senderEmail, employee);
             newEmployees++;
           }
@@ -578,7 +702,20 @@ function processSingleEmail(message, employee, existingHashes) {
   const senderName = employee.hoTen || extractSenderName(message.getFrom());
   const submitTime = message.getDate();
   const msgId = message.getId();
-  const deadline = getDeadlineForEmail(submitTime, senderEmail);
+
+  // Phân loại báo cáo theo tiêu đề (trả về 'BC Tuần' nếu không có signal rõ)
+  let subject = '';
+  try { subject = message.getSubject() || ''; } catch (e) { /* ignore */ }
+  const reportType = classifyReportType(subject);
+  const deadline = getDeadlineForReport_(reportType, submitTime, senderEmail);
+
+  // Nếu người gửi là TP đã biết trước (trong TP_PHONGBAN_MAP_) mà dòng sheet
+  // đang để "MỚI_TỰ_ĐỘNG" hoặc rỗng → tự điền phòng ban giúp HR.
+  if (TP_PHONGBAN_MAP_[senderEmail] &&
+      (!employee.phongBan || employee.phongBan === 'MỚI_TỰ_ĐỘNG')) {
+    syncPhongBanForTP_(senderEmail);
+    employee.phongBan = TP_PHONGBAN_MAP_[senderEmail];
+  }
 
   const attachments = message.getAttachments();
   const validFiles = attachments.filter(att => isValidFile(att.getName()));
@@ -593,7 +730,7 @@ function processSingleEmail(message, employee, existingHashes) {
       fileLink: '',
       gmailMsgId: msgId,
       fileHash: '',
-      reportType: 'BC Tuần'
+      reportType: reportType
     };
   }
 
@@ -634,7 +771,7 @@ function processSingleEmail(message, employee, existingHashes) {
     fileLink: fileLinks.length > 0 ? fileLinks[0] : '',
     gmailMsgId: msgId,
     fileHash: allHashes.join(','),
-    reportType: 'BC Tuần'
+    reportType: reportType
   };
 }
 
@@ -1170,7 +1307,8 @@ function rescanAllEmails() {
           if (!employee) {
             const senderName = extractSenderName(message.getFrom());
             autoAddEmployee(senderEmail, senderName);
-            employee = { email: senderEmail, hoTen: senderName, phongBan: 'MỚI_TỰ_ĐỘNG' };
+            const inferredPhongBan = TP_PHONGBAN_MAP_[senderEmail] || 'MỚI_TỰ_ĐỘNG';
+            employee = { email: senderEmail, hoTen: senderName, phongBan: inferredPhongBan };
             employees.set(senderEmail, employee);
             newEmployees++;
           }
