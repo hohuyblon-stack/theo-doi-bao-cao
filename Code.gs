@@ -1,7 +1,12 @@
 /**
  * ============================================================================
- * HỆ THỐNG THEO DÕI BÁO CÁO - PHIÊN BẢN 2.2
+ * HỆ THỐNG THEO DÕI BÁO CÁO - PHIÊN BẢN 2.3
  * ============================================================================
+ *
+ * THAY ĐỔI SO VỚI 2.2:
+ * - Tự nhận diện email alias (toanlv@mastsaigon.com.vn → .com)
+ * - Tự phân loại BC Tháng/KPI/Tổng kết theo tiêu đề email → deadline đúng
+ * - Tự điền PhongBan cho TP đã biết (bỏ "MỚI_TỰ_ĐỘNG")
  *
  * TÍNH NĂNG:
  * 1. Quét Gmail tự động, nhận diện file đính kèm từ BẤT KỲ AI
@@ -12,6 +17,7 @@
  * 6. Nhắc nhở tự động: T2 nhắc NV+TP, T3 nhắc trễ hạn
  * 7. Nhắc BC tháng: Mùng 1 nhắc NV KD, Ngày 26 nhắc TP
  * 8. Báo cáo tổng hợp gửi sếp hàng tuần (Thứ 4 sáng)
+ * 9. Tự phân loại BC Tháng/KPI/Tổng kết + deadline chính xác theo loại
  *
  * CẤU TRÚC SHEET "Nhật Ký Báo Cáo":
  *   STT | Email | Họ Tên | Phòng Ban | Loại BC | Thời Gian Nộp | Hạn Nộp | Trạng Thái | Link File | GmailMsgId(ẩn) | FileHash(ẩn)
