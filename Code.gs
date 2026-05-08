@@ -128,6 +128,357 @@ const CONFIG = {
 };
 
 // ============================================================================
+// CẤU HÌNH ĐỘNG - Sheet "Cấu Hình"
+// ============================================================================
+// HR có thể tự sửa nhân sự / deadline / excluded qua Google Sheet, không
+// phải edit code. loadConfig() đọc sheet, merge vào object CONFIG, cache 5
+// phút trong CacheService.
+//
+// Sheet "Cấu Hình" có 5 section, được phân tách bằng dòng "## TENSECTION ##":
+//   ## TruongPhong ##           → cột [Email, Ghi chú]
+//   ## Excluded ##              → cột [Email/Pattern, Ghi chú]
+//   ## CustomMonthlyDeadlines ##→ cột [Email, Ngày, Giờ, Phút, Ghi chú]
+//   ## PhongKD ##               → cột [Tên phòng]
+//   ## Settings ##              → cột [Key, Value, Ghi chú]
+//
+// Settings dùng Key dạng dot-notation cho object (VD: DEADLINE_NV.hour).
+// SUMMARY_REPORT_EMAILS dùng chuỗi phân cách dấu phẩy.
+
+const CONFIG_SHEET_NAME = 'Cấu Hình';
+const CONFIG_CACHE_KEY = 'CONFIG_OVERRIDES_V1';
+const CONFIG_CACHE_TTL_SECONDS = 300; // 5 phút
+
+/**
+ * Tạo sheet "Cấu Hình" với khung 5 section (rỗng) nếu chưa tồn tại.
+ * Để đổ dữ liệu hardcode hiện tại vào sheet, gọi seedConfigFromCode().
+ */
+function setupConfigSheet() {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+    let sheet = ss.getSheetByName(CONFIG_SHEET_NAME);
+    if (sheet) {
+      Logger.log('→ Sheet "' + CONFIG_SHEET_NAME + '" đã tồn tại, không tạo lại.');
+      return sheet;
+    }
+    sheet = ss.insertSheet(CONFIG_SHEET_NAME);
+
+    // Title
+    sheet.getRange(1, 1).setValue('Cấu hình MAST – sửa trực tiếp ở đây (cache 5 phút).');
+    sheet.getRange(1, 1, 1, 5)
+      .setFontWeight('bold').setBackground('#1a73e8').setFontColor('white');
+    sheet.setColumnWidth(1, 280);
+    sheet.setColumnWidth(2, 200);
+    sheet.setColumnWidth(3, 80);
+    sheet.setColumnWidth(4, 80);
+    sheet.setColumnWidth(5, 240);
+    sheet.setFrozenRows(1);
+
+    const sections = [
+      { name: 'TruongPhong',            headers: ['Email', 'Ghi chú'] },
+      { name: 'Excluded',               headers: ['Email/Pattern', 'Ghi chú'] },
+      { name: 'CustomMonthlyDeadlines', headers: ['Email', 'Ngày', 'Giờ', 'Phút', 'Ghi chú'] },
+      { name: 'PhongKD',                headers: ['Tên phòng'] },
+      { name: 'Settings',               headers: ['Key', 'Value', 'Ghi chú'] }
+    ];
+
+    let row = 3;
+    sections.forEach(function(sec) {
+      sheet.getRange(row, 1).setValue('## ' + sec.name + ' ##');
+      sheet.getRange(row, 1, 1, 5).setFontWeight('bold').setBackground('#e8f0fe');
+      row++;
+      const padded = sec.headers.concat(new Array(5 - sec.headers.length).fill(''));
+      sheet.getRange(row, 1, 1, 5).setValues([padded])
+        .setFontWeight('bold').setBackground('#f1f3f4');
+      row += 2; // dòng header + 1 dòng trống dự phòng
+    });
+
+    Logger.log('✓ Tạo sheet "' + CONFIG_SHEET_NAME + '" với 5 section trống.');
+    Logger.log('→ Tiếp theo: chạy seedConfigFromCode() để đổ dữ liệu hardcode hiện tại vào sheet.');
+    return sheet;
+  } catch (error) {
+    Logger.log('✗ Lỗi setupConfigSheet: ' + error.message);
+    return null;
+  }
+}
+
+/**
+ * Đọc sheet "Cấu Hình", parse thành object overrides.
+ * Trả về null nếu sheet không tồn tại.
+ */
+function parseConfigSheet_() {
+  const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG_SHEET_NAME);
+  if (!sheet) return null;
+  const data = sheet.getDataRange().getValues();
+
+  const overrides = {
+    TRUONG_PHONG_EMAILS: null,
+    EXCLUDED_EMAILS: null,
+    CUSTOM_MONTHLY_DEADLINES: null,
+    PHONG_KD_NAMES: null,
+    settings: {}
+  };
+
+  let section = null;
+  let pastHeaderRow = false;
+
+  for (let i = 0; i < data.length; i++) {
+    const colA = (data[i][0] || '').toString().trim();
+
+    // Section marker: "## NAME ##"
+    const m = colA.match(/^##\s*(\w+)\s*##$/);
+    if (m) {
+      section = m[1];
+      pastHeaderRow = false;
+      if (section === 'TruongPhong'            && !overrides.TRUONG_PHONG_EMAILS)      overrides.TRUONG_PHONG_EMAILS = [];
+      if (section === 'Excluded'               && !overrides.EXCLUDED_EMAILS)          overrides.EXCLUDED_EMAILS = [];
+      if (section === 'CustomMonthlyDeadlines' && !overrides.CUSTOM_MONTHLY_DEADLINES) overrides.CUSTOM_MONTHLY_DEADLINES = {};
+      if (section === 'PhongKD'                && !overrides.PHONG_KD_NAMES)           overrides.PHONG_KD_NAMES = [];
+      continue;
+    }
+    if (!section) continue;
+
+    // Bỏ dòng header (dòng đầu tiên không rỗng sau marker)
+    if (!pastHeaderRow) {
+      if (colA) pastHeaderRow = true;
+      continue;
+    }
+    if (!colA) continue; // dòng trống → skip
+
+    switch (section) {
+      case 'TruongPhong':
+        overrides.TRUONG_PHONG_EMAILS.push(colA.toLowerCase());
+        break;
+      case 'Excluded':
+        overrides.EXCLUDED_EMAILS.push(colA);
+        break;
+      case 'PhongKD':
+        overrides.PHONG_KD_NAMES.push(colA);
+        break;
+      case 'CustomMonthlyDeadlines': {
+        const day    = parseInt(data[i][1], 10);
+        const hour   = parseInt(data[i][2], 10);
+        const minute = parseInt(data[i][3], 10);
+        if (!isNaN(day) && !isNaN(hour) && !isNaN(minute)) {
+          overrides.CUSTOM_MONTHLY_DEADLINES[colA.toLowerCase()] = {
+            day: day, hour: hour, minute: minute
+          };
+        }
+        break;
+      }
+      case 'Settings':
+        overrides.settings[colA] = data[i][1];
+        break;
+    }
+  }
+
+  return overrides;
+}
+
+/**
+ * Coerce giá trị sheet sang kiểu phù hợp (số / bool / chuỗi).
+ */
+function coerceConfigValue_(value) {
+  if (value === '' || value === null || value === undefined) return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  const s = String(value).trim();
+  if (/^-?\d+$/.test(s))         return parseInt(s, 10);
+  if (/^-?\d+\.\d+$/.test(s))    return parseFloat(s);
+  if (s.toLowerCase() === 'true')  return true;
+  if (s.toLowerCase() === 'false') return false;
+  return s;
+}
+
+/**
+ * Áp overrides (đã parse) lên object CONFIG (mutate in-place).
+ */
+function applyOverrides_(overrides) {
+  if (Array.isArray(overrides.TRUONG_PHONG_EMAILS)) {
+    CONFIG.TRUONG_PHONG_EMAILS = overrides.TRUONG_PHONG_EMAILS.slice();
+  }
+  if (Array.isArray(overrides.EXCLUDED_EMAILS)) {
+    CONFIG.EXCLUDED_EMAILS = overrides.EXCLUDED_EMAILS.slice();
+  }
+  if (Array.isArray(overrides.PHONG_KD_NAMES)) {
+    CONFIG.PHONG_KD_NAMES = overrides.PHONG_KD_NAMES.slice();
+  }
+  if (overrides.CUSTOM_MONTHLY_DEADLINES && typeof overrides.CUSTOM_MONTHLY_DEADLINES === 'object') {
+    CONFIG.CUSTOM_MONTHLY_DEADLINES = {};
+    Object.keys(overrides.CUSTOM_MONTHLY_DEADLINES).forEach(function(k) {
+      CONFIG.CUSTOM_MONTHLY_DEADLINES[k] = overrides.CUSTOM_MONTHLY_DEADLINES[k];
+    });
+  }
+  if (overrides.settings && typeof overrides.settings === 'object') {
+    Object.keys(overrides.settings).forEach(function(key) {
+      const value = overrides.settings[key];
+      if (key.indexOf('.') !== -1) {
+        // Dot-notation: DEADLINE_NV.hour → CONFIG.DEADLINE_NV.hour
+        const parts = key.split('.');
+        const root = parts[0];
+        const sub  = parts[1];
+        if (!CONFIG[root] || typeof CONFIG[root] !== 'object') CONFIG[root] = {};
+        CONFIG[root][sub] = coerceConfigValue_(value);
+      } else if (key === 'SUMMARY_REPORT_EMAILS') {
+        CONFIG.SUMMARY_REPORT_EMAILS = String(value || '')
+          .split(',')
+          .map(function(s) { return s.trim().toLowerCase(); })
+          .filter(function(s) { return !!s; });
+      } else {
+        CONFIG[key] = coerceConfigValue_(value);
+      }
+    });
+  }
+}
+
+/**
+ * ★ ĐỌC CONFIG TỪ SHEET ★
+ * Cache 5 phút trong CacheService. Nếu sheet không tồn tại, giữ nguyên
+ * giá trị hardcode trong file.
+ *
+ * Gọi ở đầu mỗi entry-point function (processEmails, sendMondayReminder,
+ * v.v.) để đảm bảo CONFIG luôn phản ánh dữ liệu mới nhất từ sheet.
+ */
+function loadConfig() {
+  try {
+    const cache = CacheService.getScriptCache();
+    let overrides = null;
+
+    const cached = cache.get(CONFIG_CACHE_KEY);
+    if (cached) {
+      try { overrides = JSON.parse(cached); } catch (e) { overrides = null; }
+    }
+    if (!overrides) {
+      overrides = parseConfigSheet_();
+      if (overrides) {
+        try {
+          cache.put(CONFIG_CACHE_KEY, JSON.stringify(overrides), CONFIG_CACHE_TTL_SECONDS);
+        } catch (e) { /* cache write failure non-fatal */ }
+      }
+    }
+
+    if (overrides) applyOverrides_(overrides);
+    return CONFIG;
+  } catch (error) {
+    Logger.log('✗ Lỗi loadConfig: ' + error.message);
+    return CONFIG;
+  }
+}
+
+/**
+ * Xoá cache để lần loadConfig() kế tiếp đọc lại từ sheet.
+ * Gọi sau khi sửa sheet nếu muốn áp dụng ngay (không đợi 5 phút).
+ */
+function clearConfigCache() {
+  try {
+    CacheService.getScriptCache().remove(CONFIG_CACHE_KEY);
+    Logger.log('✓ Đã xoá cache CONFIG');
+  } catch (error) {
+    Logger.log('✗ Lỗi clearConfigCache: ' + error.message);
+  }
+}
+
+/**
+ * ★ CHẠY MỘT LẦN ★
+ * Đổ toàn bộ giá trị hardcode hiện tại trong CONFIG vào sheet "Cấu Hình".
+ * Sau khi chạy, HR có thể sửa trực tiếp trên sheet thay vì sửa code.
+ */
+function seedConfigFromCode() {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+    let sheet = ss.getSheetByName(CONFIG_SHEET_NAME);
+    if (!sheet) {
+      sheet = setupConfigSheet();
+      if (!sheet) {
+        Logger.log('✗ Không thể tạo sheet ' + CONFIG_SHEET_NAME);
+        return;
+      }
+    } else {
+      sheet.clear();
+    }
+
+    // Title
+    sheet.getRange(1, 1).setValue('Cấu hình MAST – sửa trực tiếp ở đây (cache 5 phút).');
+    sheet.getRange(1, 1, 1, 5)
+      .setFontWeight('bold').setBackground('#1a73e8').setFontColor('white');
+    sheet.setColumnWidth(1, 280);
+    sheet.setColumnWidth(2, 200);
+    sheet.setColumnWidth(3, 80);
+    sheet.setColumnWidth(4, 80);
+    sheet.setColumnWidth(5, 240);
+    sheet.setFrozenRows(1);
+
+    let row = 3;
+    const writeSection = function(name, headers, dataRows) {
+      sheet.getRange(row, 1).setValue('## ' + name + ' ##');
+      sheet.getRange(row, 1, 1, 5).setFontWeight('bold').setBackground('#e8f0fe');
+      row++;
+      const paddedH = headers.concat(new Array(5 - headers.length).fill(''));
+      sheet.getRange(row, 1, 1, 5).setValues([paddedH])
+        .setFontWeight('bold').setBackground('#f1f3f4');
+      row++;
+      if (dataRows.length > 0) {
+        const paddedD = dataRows.map(function(r) {
+          return r.concat(new Array(5 - r.length).fill(''));
+        });
+        sheet.getRange(row, 1, paddedD.length, 5).setValues(paddedD);
+        row += paddedD.length;
+      }
+      row++; // dòng trống ngăn cách
+    };
+
+    writeSection('TruongPhong', ['Email', 'Ghi chú'],
+      CONFIG.TRUONG_PHONG_EMAILS.map(function(e) { return [e, '']; }));
+
+    writeSection('Excluded', ['Email/Pattern', 'Ghi chú'],
+      CONFIG.EXCLUDED_EMAILS.map(function(e) { return [e, '']; }));
+
+    writeSection('CustomMonthlyDeadlines', ['Email', 'Ngày', 'Giờ', 'Phút', 'Ghi chú'],
+      Object.keys(CONFIG.CUSTOM_MONTHLY_DEADLINES).map(function(k) {
+        const v = CONFIG.CUSTOM_MONTHLY_DEADLINES[k];
+        return [k, v.day, v.hour, v.minute, ''];
+      }));
+
+    writeSection('PhongKD', ['Tên phòng'],
+      CONFIG.PHONG_KD_NAMES.map(function(p) { return [p]; }));
+
+    const settings = [
+      ['HR_EMAIL',                       CONFIG.HR_EMAIL,                     ''],
+      ['COMPANY_NAME',                   CONFIG.COMPANY_NAME,                 ''],
+      ['GMAIL_LABEL',                    CONFIG.GMAIL_LABEL,                  ''],
+      ['SEARCH_DAYS',                    CONFIG.SEARCH_DAYS,                  'Số ngày quét lại Gmail'],
+      ['DEADLINE_NV.day',                CONFIG.DEADLINE_NV.day,              '1=Thứ 2'],
+      ['DEADLINE_NV.hour',               CONFIG.DEADLINE_NV.hour,             ''],
+      ['DEADLINE_NV.minute',             CONFIG.DEADLINE_NV.minute,           ''],
+      ['DEADLINE_TP.day',                CONFIG.DEADLINE_TP.day,              '1=Thứ 2'],
+      ['DEADLINE_TP.hour',               CONFIG.DEADLINE_TP.hour,             ''],
+      ['DEADLINE_TP.minute',             CONFIG.DEADLINE_TP.minute,           ''],
+      ['DEADLINE_NV_MONTHLY.day',        CONFIG.DEADLINE_NV_MONTHLY.day,      ''],
+      ['DEADLINE_NV_MONTHLY.hour',       CONFIG.DEADLINE_NV_MONTHLY.hour,     ''],
+      ['DEADLINE_NV_MONTHLY.minute',     CONFIG.DEADLINE_NV_MONTHLY.minute,   ''],
+      ['DEADLINE_TP_MONTHLY.day',        CONFIG.DEADLINE_TP_MONTHLY.day,      ''],
+      ['DEADLINE_TP_MONTHLY.hour',       CONFIG.DEADLINE_TP_MONTHLY.hour,     ''],
+      ['DEADLINE_TP_MONTHLY.minute',     CONFIG.DEADLINE_TP_MONTHLY.minute,   ''],
+      ['SUMMARY_REPORT_DEADLINE.day',    CONFIG.SUMMARY_REPORT_DEADLINE.day,    ''],
+      ['SUMMARY_REPORT_DEADLINE.hour',   CONFIG.SUMMARY_REPORT_DEADLINE.hour,   ''],
+      ['SUMMARY_REPORT_DEADLINE.minute', CONFIG.SUMMARY_REPORT_DEADLINE.minute, ''],
+      ['SUMMARY_REPORT_EMAILS',          CONFIG.SUMMARY_REPORT_EMAILS.join(','), 'Phân cách bằng dấu phẩy']
+    ];
+    writeSection('Settings', ['Key', 'Value', 'Ghi chú'], settings);
+
+    clearConfigCache();
+    Logger.log('✓ Đã đổ ' + CONFIG.TRUONG_PHONG_EMAILS.length + ' TP, '
+      + CONFIG.EXCLUDED_EMAILS.length + ' excluded, '
+      + Object.keys(CONFIG.CUSTOM_MONTHLY_DEADLINES).length + ' custom deadlines, '
+      + CONFIG.PHONG_KD_NAMES.length + ' phòng KD, '
+      + settings.length + ' settings vào sheet "' + CONFIG_SHEET_NAME + '".');
+    Logger.log('→ Cache đã xoá; lần loadConfig() tới sẽ đọc từ sheet.');
+  } catch (error) {
+    Logger.log('✗ Lỗi seedConfigFromCode: ' + error.message);
+    Logger.log(error.stack);
+  }
+}
+
+// ============================================================================
 // MIGRATION V2 - CHẠY MỘT LẦN
 // ============================================================================
 
@@ -158,8 +509,12 @@ function migrateToV2() {
       empSheet.getRange(1, 1, 1, 3).setFontWeight('bold').setBackground('#4a86e8').setFontColor('white');
     }
 
+    // Đảm bảo sheet "Cấu Hình" tồn tại (HR sửa nhân sự / deadline ở đây)
+    setupConfigSheet();
+
     Logger.log('★★★ NÂNG CẤP V2 HOÀN THÀNH ★★★');
-    Logger.log('Tiếp theo: chạy setupTriggers() rồi rescanAllEmails()');
+    Logger.log('Tiếp theo: chạy seedConfigFromCode() (đổ config vào sheet),');
+    Logger.log('             setupTriggers() rồi rescanAllEmails().');
   } catch (error) {
     Logger.log('✗ LỖI: ' + error.message);
     Logger.log(error.stack);
@@ -709,6 +1064,7 @@ function saveAttachmentToDrive(attachment, senderName) {
  * Phát hiện file trùng lặp.
  */
 function processEmails() {
+  loadConfig();
   Logger.log('=== QUÉT EMAIL: ' + formatDateTime(new Date()) + ' ===');
 
   try {
@@ -1076,6 +1432,7 @@ function getSubmittedThisMonth(reportType) {
  *  - TP: deadline trưa nay 12:00
  */
 function sendMondayReminder() {
+  loadConfig();
   Logger.log('=== THỨ 2: NHẮC NHỞ BC TUẦN ===');
   try {
     const employees = getActiveEmployees();
@@ -1131,6 +1488,7 @@ function sendMondayReminder() {
  *  - TP đã trễ (deadline T2 12:00 đã qua)
  */
 function sendTuesdayLateReminder() {
+  loadConfig();
   Logger.log('=== THỨ 3: NHẮC MẠNH NGƯỜI TRỄ HẠN BC TUẦN ===');
   try {
     const employees = getActiveEmployees();
@@ -1197,6 +1555,7 @@ function sendTuesdayLateReminder() {
  * - GĐ SG (nhanntt): deadline ngày 28 cho BC KH (xử lý riêng ở sendMonthlyReminder_TP)
  */
 function sendMonthlyReminder_NV() {
+  loadConfig();
   Logger.log('=== MÙNG 1: NHẮC NV KD NỘP BÁO CÁO THÁNG ===');
   try {
     const employees = getActiveEmployees();
@@ -1255,6 +1614,7 @@ function sendMonthlyReminder_NV() {
  * Bao gồm GĐ SG (nhanntt): BC Kế hoạch tháng tới - deadline ngày 28
  */
 function sendMonthlyReminder_TP() {
+  loadConfig();
   Logger.log('=== NGÀY 26: NHẮC TP NỘP KẾ HOẠCH + KPI ===');
   try {
     const employees = getActiveEmployees();
@@ -1324,6 +1684,7 @@ function sendMonthlyReminder_TP() {
  * Nhanntt@mastsaigon.com - deadline ngày 9, 23:59
  */
 function sendMonthlySummaryReminder_GD() {
+  loadConfig();
   Logger.log('=== NGÀY 7: NHẮC GĐ SG NỘP BC TỔNG KẾT ===');
   try {
     const submitted = getSubmittedThisMonth('BC Tổng Kết');
@@ -1369,6 +1730,7 @@ function sendMonthlySummaryReminder_GD() {
  * (Dời từ T2 sang T4 vì deadline NV/TP đều là T2, cần 1 ngày buffer)
  */
 function sendWeeklyReport() {
+  loadConfig();
   Logger.log('=== GỬI BÁO CÁO TỔNG HỢP TUẦN ===');
   try {
     const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
@@ -1507,6 +1869,7 @@ function sendWeeklyReport() {
  * Tự động thêm nhân viên mới.
  */
 function rescanAllEmails() {
+  loadConfig();
   Logger.log('=== QUÉT LẠI TOÀN BỘ EMAIL (30 ngày) ===');
 
   try {
@@ -1571,6 +1934,7 @@ function rescanAllEmails() {
 }
 
 function checkSystemStatus() {
+  loadConfig();
   try {
     const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
     const logSheet = ss.getSheetByName(CONFIG.SHEET_LOG);
@@ -1618,6 +1982,7 @@ function deleteAllTriggers() {
  * Test nhắc nhở (không cần đợi đúng ngày)
  */
 function testReminders() {
+  loadConfig();
   Logger.log('=== TEST NHẮC NHỞ ===');
   const employees = getActiveEmployees();
   const submitted = getSubmittedThisWeek();
@@ -1638,6 +2003,7 @@ function testReminders() {
  * Chạy hàm này để verify trước khi deploy.
  */
 function testMastSGConfig() {
+  loadConfig();
   Logger.log('=== TEST CẤU HÌNH MAST SG ===');
   const now = new Date();
   const testDate = now; // Dùng ngày hiện tại để test
