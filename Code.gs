@@ -442,6 +442,103 @@ function _calcDeadline(date, deadlineConfig) {
 }
 
 /**
+ * Tính deadline BC TỔNG KẾT (ngày 9 lúc 23:59 - dành cho GĐ SG)
+ * @param {Date} date - Ngày gửi email
+ * @returns {Date} deadline ngày 9 tháng hiện tại hoặc tháng sau
+ */
+function getSummaryReportDeadline(date) {
+  const d = (date instanceof Date && !isNaN(date.getTime())) ? new Date(date) : new Date();
+  const cfg = CONFIG.SUMMARY_REPORT_DEADLINE;
+  let target = new Date(d.getFullYear(), d.getMonth(), cfg.day, cfg.hour, cfg.minute, 0, 0);
+  if (d.getTime() > target.getTime()) {
+    target = new Date(d.getFullYear(), d.getMonth() + 1, cfg.day, cfg.hour, cfg.minute, 0, 0);
+  }
+  return target;
+}
+
+/**
+ * ★ NHẬN DIỆN LOẠI BÁO CÁO ★
+ * Phân loại email thành 1 trong 5 loại để áp dụng deadline đúng:
+ *   'BC Tuần' | 'BC Tháng' | 'KH Tháng' | 'KPI Tháng' | 'BC Tổng Kết'
+ *
+ * Logic ưu tiên (kiểm tra theo thứ tự, dừng ở match đầu tiên):
+ *   1) Subject khớp /tổng kết|tong ket/i           → 'BC Tổng Kết'
+ *   2) Subject khớp /kpi/i                          → 'KPI Tháng'
+ *   3) Subject khớp /kế hoạch tháng|ke hoach thang/i → 'KH Tháng'
+ *   4) Subject khớp /báo cáo tháng|bao cao thang|bc tháng/i → 'BC Tháng'
+ *   5) Ngày gửi 1-9  + người gửi là NV KD          → 'BC Tháng'
+ *   6) Ngày gửi 25-31 + người gửi là TP            → 'KH Tháng'
+ *   7) Ngày 5-12 + email ∈ SUMMARY_REPORT_EMAILS   → 'BC Tổng Kết'
+ *   8) Mặc định                                     → 'BC Tuần'
+ *
+ * @param {GmailMessage|Object} message - email Gmail (cần có .getSubject())
+ * @param {Date} submitDate - ngày gửi
+ * @param {string} email - email người gửi (đã extract)
+ * @returns {string}
+ */
+function detectReportType(message, submitDate, email) {
+  // Lấy subject - chịu lỗi nếu message không hợp lệ
+  let subject = '';
+  try {
+    if (message && typeof message.getSubject === 'function') {
+      subject = message.getSubject() || '';
+    }
+  } catch (e) {
+    subject = '';
+  }
+
+  // 1-4: Khớp subject (ưu tiên cao nhất)
+  if (/tổng kết|tong ket/i.test(subject)) return 'BC Tổng Kết';
+  if (/kpi/i.test(subject)) return 'KPI Tháng';
+  if (/kế hoạch tháng|ke hoach thang/i.test(subject)) return 'KH Tháng';
+  if (/báo cáo tháng|bao cao thang|bc tháng/i.test(subject)) return 'BC Tháng';
+
+  // Fallback: theo ngày gửi + role
+  const day = (submitDate instanceof Date && !isNaN(submitDate.getTime()))
+    ? submitDate.getDate()
+    : new Date().getDate();
+  const emailLower = (email || '').toLowerCase().trim();
+
+  // 5: Ngày 1-9 + NV KD → BC Tháng
+  if (day >= 1 && day <= 9 && isNhanVienKD(emailLower)) {
+    return 'BC Tháng';
+  }
+  // 6: Ngày 25-31 + TP → KH Tháng (TP nộp KH cho tháng tiếp theo)
+  if (day >= 25 && day <= 31 && isTruongPhong(emailLower)) {
+    return 'KH Tháng';
+  }
+  // 7: Ngày 5-12 + email ∈ SUMMARY_REPORT_EMAILS → BC Tổng Kết
+  if (day >= 5 && day <= 12 && CONFIG.SUMMARY_REPORT_EMAILS.indexOf(emailLower) !== -1) {
+    return 'BC Tổng Kết';
+  }
+
+  // 8: Mặc định
+  return 'BC Tuần';
+}
+
+/**
+ * Lấy deadline tương ứng với loại báo cáo
+ * @param {string} reportType - 'BC Tuần' | 'BC Tháng' | 'KH Tháng' | 'KPI Tháng' | 'BC Tổng Kết'
+ * @param {Date} submitDate - ngày gửi
+ * @param {string} email - email người gửi
+ * @returns {Date} deadline tương ứng
+ */
+function getDeadlineByReportType(reportType, submitDate, email) {
+  switch (reportType) {
+    case 'BC Tháng':
+      return getMonthlyDeadlineNV(submitDate, email);
+    case 'KH Tháng':
+    case 'KPI Tháng':
+      return getMonthlyDeadlineTP(submitDate);
+    case 'BC Tổng Kết':
+      return getSummaryReportDeadline(submitDate);
+    case 'BC Tuần':
+    default:
+      return getDeadlineForEmail(submitDate, email);
+  }
+}
+
+/**
  * Tính hash MD5 của file đính kèm để phát hiện trùng lặp
  */
 function computeFileHash(attachment) {
@@ -689,7 +786,9 @@ function processSingleEmail(message, employee, existingHashes) {
   const senderName = employee.hoTen || extractSenderName(message.getFrom());
   const submitTime = message.getDate();
   const msgId = message.getId();
-  const deadline = getDeadlineForEmail(submitTime, senderEmail);
+  // Nhận diện loại BC + tính deadline tương ứng
+  const reportType = detectReportType(message, submitTime, senderEmail);
+  const deadline = getDeadlineByReportType(reportType, submitTime, senderEmail);
 
   const attachments = message.getAttachments();
   const validFiles = attachments.filter(att => isValidFile(att.getName()));
@@ -704,7 +803,7 @@ function processSingleEmail(message, employee, existingHashes) {
       fileLink: '',
       gmailMsgId: msgId,
       fileHash: '',
-      reportType: 'BC Tuần'
+      reportType: reportType
     };
   }
 
@@ -747,7 +846,7 @@ function processSingleEmail(message, employee, existingHashes) {
     fileLink: fileLinks.length > 0 ? fileLinks[0] : '',
     gmailMsgId: msgId,
     fileHash: allHashes.join(','),
-    reportType: 'BC Tuần'
+    reportType: reportType
   };
 }
 
@@ -1541,6 +1640,51 @@ function testMastSGConfig() {
     if (ok) pass++; else fail++;
     Logger.log((ok ? '✓ PASS' : '✗ FAIL') + ' | isTruongPhong(' + email + ') = ' + actual + ' (kỳ vọng: ' + expected + ')');
   }
+
+  // ── DETECT REPORT TYPE ──
+  // Mock message factory để test mà không cần Gmail thật
+  const mockMsg = function(subject) {
+    return { getSubject: function() { return subject || ''; } };
+  };
+  // Tạo Date cho ngày cụ thể trong tháng hiện tại (tránh phụ thuộc múi giờ)
+  const dayInThisMonth = function(day) {
+    const n = new Date();
+    return new Date(n.getFullYear(), n.getMonth(), day, 10, 0, 0, 0);
+  };
+
+  Logger.log('\n── DETECT REPORT TYPE ──');
+  const detectCases = [
+    // Subject-based (rule 1-4)
+    { msg: mockMsg('Tổng kết hoạt động tháng 4 - SG'), date: dayInThisMonth(15), email: 'nhanntt@mastsaigon.com', expected: 'BC Tổng Kết', note: 'rule 1: subject tổng kết' },
+    { msg: mockMsg('BC KPI tháng 4 phòng KD'),         date: dayInThisMonth(20), email: 'sonpt@mast.com.vn',     expected: 'KPI Tháng',   note: 'rule 2: subject KPI' },
+    { msg: mockMsg('Kế hoạch tháng 5 - phòng KD'),     date: dayInThisMonth(20), email: 'sonpt@mast.com.vn',     expected: 'KH Tháng',    note: 'rule 3: subject kế hoạch tháng' },
+    { msg: mockMsg('Báo cáo tháng 4 - Sales SG'),      date: dayInThisMonth(15), email: 'hotd@mastsaigon.com',   expected: 'BC Tháng',    note: 'rule 4: subject báo cáo tháng' },
+    { msg: mockMsg('Bao cao thang 4'),                 date: dayInThisMonth(15), email: 'hotd@mastsaigon.com',   expected: 'BC Tháng',    note: 'rule 4: không dấu' },
+    // Day-based (rule 5-7)
+    { msg: mockMsg('BC Tuần 18'),                      date: dayInThisMonth(26), email: 'sonpt@mast.com.vn',     expected: 'KH Tháng',    note: 'rule 6: ngày 25-31 + TP' },
+    { msg: mockMsg(''),                                date: dayInThisMonth(7),  email: 'nhanntt@mastsaigon.com', expected: 'BC Tổng Kết', note: 'rule 7: ngày 5-12 + GĐ SG' },
+    // Default (rule 8)
+    { msg: mockMsg('Báo cáo tuần 19'),                 date: dayInThisMonth(15), email: 'hotd@mastsaigon.com',   expected: 'BC Tuần',     note: 'rule 8: subject "báo cáo tuần" không khớp rule 4' },
+    { msg: mockMsg(''),                                date: dayInThisMonth(15), email: 'baond@mastsaigon.com',  expected: 'BC Tuần',     note: 'rule 8: TP giữa tháng, không subject' },
+    // Case insensitivity
+    { msg: mockMsg('TỔNG KẾT THÁNG 4'),                date: dayInThisMonth(15), email: 'nhanntt@mastsaigon.com', expected: 'BC Tổng Kết', note: 'rule 1: uppercase' },
+  ];
+  for (const tc of detectCases) {
+    const actual = detectReportType(tc.msg, tc.date, tc.email);
+    const ok = actual === tc.expected;
+    if (ok) pass++; else fail++;
+    Logger.log((ok ? '✓ PASS' : '✗ FAIL') + ' | detectReportType "' + tc.msg.getSubject() + '" ngày ' + tc.date.getDate() + ' ' + tc.email
+      + ' → "' + actual + '" (kỳ vọng "' + tc.expected + '") - ' + tc.note);
+  }
+
+  // Deadline lookup theo từng loại
+  Logger.log('\n── DEADLINE THEO LOẠI BC ──');
+  const dlSummary = getSummaryReportDeadline(new Date());
+  const dlSumOk = dlSummary.getDate() === 9 && dlSummary.getHours() === 23;
+  if (dlSumOk) pass++; else fail++;
+  Logger.log((dlSumOk ? '✓ PASS' : '✗ FAIL') + ' | getSummaryReportDeadline → ngày '
+    + dlSummary.getDate() + ' lúc ' + dlSummary.getHours() + ':' + String(dlSummary.getMinutes()).padStart(2,'0')
+    + ' (kỳ vọng: 9 lúc 23:59)');
 
   Logger.log('\n=== KẾT QUẢ: ' + pass + ' PASS | ' + fail + ' FAIL ===');
   if (fail === 0) {
