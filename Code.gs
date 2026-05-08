@@ -1012,6 +1012,65 @@ function getSubmittedThisWeek() {
 }
 
 /**
+ * Lấy danh sách email đã nộp BC LOẠI reportType TRONG THÁNG HIỆN TẠI.
+ * Bỏ qua entry có status = DUPLICATE_FILE (file trùng không tính là nộp).
+ *
+ * @param {string} reportType - 'BC Tháng' | 'KH Tháng' | 'KPI Tháng' | 'BC Tổng Kết' | 'BC Tuần'
+ * @returns {Set<string>} email lowercase đã nộp loại BC này trong tháng hiện tại
+ */
+function getSubmittedThisMonth(reportType) {
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+    const sheet = ss.getSheetByName(CONFIG.SHEET_LOG);
+    if (!sheet || sheet.getLastRow() < 2) return new Set();
+
+    const data = sheet.getDataRange().getValues();
+    const submitted = new Set();
+    const now = new Date();
+    const curYear = now.getFullYear();
+    const curMonth = now.getMonth(); // 0-11
+
+    for (let i = 1; i < data.length; i++) {
+      // Cột: STT(0) Email(1) HoTen(2) PhongBan(3) LoaiBC(4) ThoiGianNop(5) HanNop(6) TrangThai(7)
+      const loaiBC = (data[i][4] || '').toString().trim();
+      if (loaiBC !== reportType) continue;
+
+      const status = (data[i][7] || '').toString().trim();
+      if (status === CONFIG.STATUS.DUPLICATE_FILE) continue;
+
+      // Parse Thời Gian Nộp - có thể là Date hoặc chuỗi "dd/MM/yyyy HH:mm"
+      const rawTime = data[i][5];
+      let submitDate = null;
+      if (rawTime instanceof Date) {
+        submitDate = rawTime;
+      } else {
+        const parts = (rawTime || '').toString().trim()
+          .match(/(\d{2})\/(\d{2})\/(\d{4}) (\d{2}):(\d{2})/);
+        if (parts) {
+          submitDate = new Date(
+            parseInt(parts[3], 10),
+            parseInt(parts[2], 10) - 1,
+            parseInt(parts[1], 10),
+            parseInt(parts[4], 10),
+            parseInt(parts[5], 10)
+          );
+        }
+      }
+      if (!submitDate) continue;
+
+      if (submitDate.getFullYear() === curYear && submitDate.getMonth() === curMonth) {
+        const email = (data[i][1] || '').toString().toLowerCase().trim();
+        if (email) submitted.add(email);
+      }
+    }
+    return submitted;
+  } catch (error) {
+    Logger.log('✗ Lỗi getSubmittedThisMonth(' + reportType + '): ' + error.message);
+    return new Set();
+  }
+}
+
+/**
  * Thứ 2 sáng 9h: Nhắc nhở BC TUẦN
  *  - NV: deadline tối nay 23:59
  *  - TP: deadline trưa nay 12:00
@@ -1141,7 +1200,8 @@ function sendMonthlyReminder_NV() {
   Logger.log('=== MÙNG 1: NHẮC NV KD NỘP BÁO CÁO THÁNG ===');
   try {
     const employees = getActiveEmployees();
-    let sent = 0;
+    const submitted = getSubmittedThisMonth('BC Tháng');
+    let sent = 0, skippedDone = 0;
     const now = new Date();
     const thangTruoc = now.getMonth() === 0 ? 12 : now.getMonth(); // tháng trước (1-12)
 
@@ -1157,6 +1217,12 @@ function sendMonthlyReminder_NV() {
         const pb = (emp.phongBan || '').trim();
         const isKD = CONFIG.PHONG_KD_NAMES.some(name => pb.toLowerCase() === name.toLowerCase());
         if (!isKD) continue;
+      }
+
+      // Đã nộp BC Tháng trong tháng này → bỏ qua, không spam
+      if (submitted.has(email)) {
+        skippedDone++;
+        continue;
       }
 
       // Xác định deadline tháng (có thể custom theo từng email)
@@ -1178,7 +1244,7 @@ function sendMonthlyReminder_NV() {
         Logger.log('✗ Không gửi được cho ' + email + ': ' + e.message);
       }
     }
-    Logger.log('✓ Mùng 1: nhắc ' + sent + ' NV KD nộp BC tháng');
+    Logger.log('✓ Mùng 1: nhắc ' + sent + ' NV KD nộp BC tháng (bỏ qua ' + skippedDone + ' người đã nộp)');
   } catch (error) {
     Logger.log('✗ Lỗi sendMonthlyReminder_NV: ' + error.message);
   }
@@ -1192,7 +1258,9 @@ function sendMonthlyReminder_TP() {
   Logger.log('=== NGÀY 26: NHẮC TP NỘP KẾ HOẠCH + KPI ===');
   try {
     const employees = getActiveEmployees();
-    let sent = 0;
+    const submittedKH  = getSubmittedThisMonth('KH Tháng');
+    const submittedKPI = getSubmittedThisMonth('KPI Tháng');
+    let sent = 0, skippedDone = 0;
     const now = new Date();
     const thangSau = now.getMonth() === 11 ? 1 : now.getMonth() + 2; // tháng tiếp theo (1-12)
     const thangTruoc = now.getMonth() === 0 ? 12 : now.getMonth(); // tháng trước (1-12)
@@ -1201,11 +1269,21 @@ function sendMonthlyReminder_TP() {
       if (isExcludedEmail(email)) continue;
       if (!isTruongPhong(email)) continue;
 
+      // GĐ SG chỉ cần KH (BC Tổng Kết đã có nhắc riêng); TP khác cần cả KH + KPI
+      const isGD = CONFIG.SUMMARY_REPORT_EMAILS.indexOf(email) !== -1;
+      const hasKH  = submittedKH.has(email);
+      const hasKPI = submittedKPI.has(email);
+      const allDone = isGD ? hasKH : (hasKH && hasKPI);
+      if (allDone) {
+        skippedDone++;
+        continue;
+      }
+
       try {
         const name = emp.hoTen || email.split('@')[0];
 
         // GĐ SG (nhanntt): nhắc BC Kế hoạch tháng tới + BC Tổng kết tháng trước
-        if (email === 'nhanntt@mastsaigon.com') {
+        if (isGD) {
           const subject = '[' + CONFIG.COMPANY_NAME + '] Nhắc nhở GĐ: BC Kế hoạch tháng ' + thangSau + ' - Hạn nộp ngày 28 lúc 23:59';
           const body = 'Xin chào ' + name + ',\n\n'
             + 'Nhắc nhở nộp báo cáo:\n'
@@ -1216,10 +1294,14 @@ function sendMonthlyReminder_TP() {
             + 'Hệ thống theo dõi báo cáo ' + CONFIG.COMPANY_NAME;
           GmailApp.sendEmail(email, subject, body);
         } else {
-          // TP MAST PRO + TP SG khác: nhắc KH + KPI thông thường
-          const subject = '[' + CONFIG.COMPANY_NAME + '] Nhắc nhở TP: Kế hoạch + KPI tháng ' + thangSau + ' - Hạn nộp ngày 28 lúc 23:59';
+          // TP MAST PRO + TP SG khác: nhắc KH + KPI, chỉ nêu phần CÒN THIẾU
+          const missing = [];
+          if (!hasKH)  missing.push('KẾ HOẠCH THÁNG ' + thangSau);
+          if (!hasKPI) missing.push('KPI THÁNG ' + thangSau);
+          const missingStr = missing.join(' + ');
+          const subject = '[' + CONFIG.COMPANY_NAME + '] Nhắc nhở TP: ' + missingStr + ' - Hạn nộp ngày 28 lúc 23:59';
           const body = 'Xin chào ' + name + ',\n\n'
-            + 'Nhắc nhở: Bạn cần nộp KẾ HOẠCH THÁNG ' + thangSau + ' + KPI THÁNG ' + thangSau + '.\n'
+            + 'Nhắc nhở: Bạn còn thiếu ' + missingStr + '.\n'
             + 'Deadline: Ngày 28 tháng này lúc 23:59.\n\n'
             + 'Vui lòng gửi qua email về: ' + CONFIG.HR_EMAIL + '\n\n'
             + 'Trân trọng,\n'
@@ -1231,7 +1313,7 @@ function sendMonthlyReminder_TP() {
         Logger.log('✗ Không gửi được cho TP ' + email + ': ' + e.message);
       }
     }
-    Logger.log('✓ Ngày 26: nhắc ' + sent + ' TP nộp KH + KPI');
+    Logger.log('✓ Ngày 26: nhắc ' + sent + ' TP nộp KH + KPI (bỏ qua ' + skippedDone + ' người đã nộp đủ)');
   } catch (error) {
     Logger.log('✗ Lỗi sendMonthlyReminder_TP: ' + error.message);
   }
@@ -1244,10 +1326,17 @@ function sendMonthlyReminder_TP() {
 function sendMonthlySummaryReminder_GD() {
   Logger.log('=== NGÀY 7: NHẮC GĐ SG NỘP BC TỔNG KẾT ===');
   try {
+    const submitted = getSubmittedThisMonth('BC Tổng Kết');
     const now = new Date();
     const thangTruoc = now.getMonth() === 0 ? 12 : now.getMonth(); // tháng trước (1-12)
 
     for (const email of CONFIG.SUMMARY_REPORT_EMAILS) {
+      // Đã nộp BC Tổng Kết tháng này → bỏ qua
+      if (submitted.has(email.toLowerCase().trim())) {
+        Logger.log('→ Bỏ qua ' + email + ' (đã nộp BC Tổng Kết tháng này)');
+        continue;
+      }
+
       try {
         const employees = getActiveEmployees();
         const emp = employees.get(email.toLowerCase().trim());
